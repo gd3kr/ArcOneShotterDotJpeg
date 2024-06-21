@@ -14,13 +14,21 @@ def save_to_file(data, file_path):
         for examples in data:
             for example in examples:
                 input_example, output_example = example
+
                 input_example = numpy_to_list(input_example)
+                input_padding_reqd = 1024 - len(input_example)
+                input_example_padded = input_example + [10] * input_padding_reqd
+
                 output_example = numpy_to_list(output_example)
-                json.dump({'Input': input_example, 'Output': output_example}, f)
+                output_padding_reqd = 1024 - len(output_example)
+                output_example_padded = output_example + [10] * output_padding_reqd
+
+                example = input_example_padded + [10] + output_example_padded
+                json.dump(example, f)
                 f.write('\n')
                 
 
-def flatten_with_separator(arr, separator=100):
+def flatten_with_separator(arr, separator=10):
     arr = np.array(arr)
     result = []
     for i, row in enumerate(arr):

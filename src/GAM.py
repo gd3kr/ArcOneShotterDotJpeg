@@ -11,15 +11,16 @@ from torch import nn
 
 @dataclass
 class ModelArgs:
-    dim: int = 1
-    n_layers: int = 12
-    n_heads: int = 12
+    dim: int = 128
+    n_layers: int = 16
+    n_heads: int = 16
     n_kv_heads: Optional[int] = None
     hidden_dim: Optional[int] = None
     multiple_of: int = 256
     norm_eps: float = 1e-5
-    max_seq_len: int = 2048
+    max_seq_len: int = 2049
     dropout: float = 0.0
+    vocab_size: int = 11
 
 
 class RMSNorm(torch.nn.Module):
@@ -99,11 +100,11 @@ class Attention(nn.Module):
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.norm = RMSNorm(1, args.norm_eps)
-        self.wq = nn.Linear(1, args.n_heads, bias=False)
-        self.wk = nn.Linear(1, self.n_kv_heads, bias=False)
-        self.wv = nn.Linear(1, self.n_kv_heads, bias=False)
-        self.wo = nn.Linear(args.n_heads, args.dim, bias=False)
+        self.head_dim = args.dim // args.n_heads
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
@@ -123,9 +124,6 @@ class Attention(nn.Module):
         freqs_sin: torch.Tensor,
     ):
         bsz, seqlen, _ = x.shape
-
-        # apply RMSNorm
-        x = self.norm(x)
 
         # QKV
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -197,7 +195,7 @@ class Router(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x)
-        return self.dropout(self.fc2(F.silu(self.fc1(x))))
+        return torch.mean(self.dropout(self.fc2(F.silu(self.fc1(x)))), dim=1)
 
 
 class GAM(nn.Module):
@@ -207,7 +205,9 @@ class GAM(nn.Module):
         super().__init__()
         self.params = params
         self.n_layers = params.n_layers
+        self.vocab_size = params.vocab_size
 
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.attn_router = Router(params)
         self.mlp_router = Router(params)
         self.global_attention_blocks = nn.ModuleList([Attention(params) for _ in range(params.n_layers)])
@@ -215,7 +215,6 @@ class GAM(nn.Module):
         self.norm = RMSNorm(params.dim, params.norm_eps)
         self.output = nn.Linear(params.dim, self.vocab_size, bias=False)
 
-        # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = self.output.weight
 
         # some useful precompute for the RoPE relative positional embeddings
@@ -225,10 +224,6 @@ class GAM(nn.Module):
 
         # init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
@@ -246,24 +241,26 @@ class GAM(nn.Module):
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
-        for _ in self.layers:
+        h = self.tok_embeddings(tokens)
+
+        for _ in range(self.n_layers):
             # pass through global attention block
             attn_weights = self.attn_router(h)
-            selected_attn = torch.topk(attn_weights, 1, dim=1).values
-            attention_block = self.global_attention_blocks[selected_attn]
+            selected_attn = torch.topk(attn_weights, 1, dim=-1)
+            attention_block = self.global_attention_blocks[selected_attn.indices.item()]
             h = h + attention_block(h, freqs_cos, freqs_sin)
 
             # pass through global mlp block
             mlp_weights = self.mlp_router(h)
-            selected_mlp = torch.topk(mlp_weights, 1, dim=1).values
-            mlp_block = self.global_mlp_blocks[selected_mlp]
+            selected_mlp = torch.topk(mlp_weights, 1, dim=-1)
+            mlp_block = self.global_mlp_blocks[selected_mlp.indices.item()]
             h = h + mlp_block(h)
 
         h = self.norm(h)
 
         if targets is not None:
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=10)
         else:
             logits = self.output(h[:, [-1], :])
             self.last_loss = None
