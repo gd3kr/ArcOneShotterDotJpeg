@@ -247,16 +247,16 @@ class GAM(nn.Module):
         freqs_sin = self.freqs_sin[:seqlen]
 
         for _ in self.layers:
-            # pass h through router and take top k layers (1)
-            layer_weights = self.router(h)
-            layer = torch.topk(layer_weights, 1, dim=1).values
-
             # pass through global attention block
-            attention_block = self.global_attention_blocks[layer]
+            attn_weights = self.attn_router(h)
+            selected_attn = torch.topk(attn_weights, 1, dim=1).values
+            attention_block = self.global_attention_blocks[selected_attn]
             h = h + attention_block(h, freqs_cos, freqs_sin)
 
             # pass through global mlp block
-            mlp_block = self.global_mlp_blocks[layer]
+            mlp_weights = self.mlp_router(h)
+            selected_mlp = torch.topk(mlp_weights, 1, dim=1).values
+            mlp_block = self.global_mlp_blocks[selected_mlp]
             h = h + mlp_block(h)
 
         h = self.norm(h)
