@@ -41,6 +41,7 @@ def flatten_with_separator(arr, separator=10):
 def load_data(file_paths):
     train_data = []
     test_data = []
+
     for file_path in file_paths:
         rules_input = []
         test_input = []
